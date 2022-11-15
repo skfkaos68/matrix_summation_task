@@ -17,6 +17,7 @@
 {% endblock %}
 
 {% block scripts %}
+{% include 'realefforttask/includes/js_work_page.html' %}
     <script>
         $(function () {
             $(window).keydown(function (event) {
@@ -29,7 +30,7 @@
 
         });
     </script>
-    {% include 'realefforttask/includes/js_work_page.html' %}
+    
 {% endblock %}
 {% block styles %}
     <style type="text/css">

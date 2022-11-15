@@ -5,8 +5,10 @@ from otree.api import (
 
 from django.db import models as djmodels
 from django.db.models import F
-from . import ret_functions
+from django.core.exceptions import ObjectDoesNotExist
 
+from . import ret_functions
+from otree.lookup import get_page_lookup
 author = ''
 
 doc = """
@@ -20,7 +22,8 @@ class Constants(BaseConstants):
     num_rounds = 1
     # this parameter defines how much time a user will stay on a RET page per round (in seconds)
     task_time = 3000
-
+    PRACTICE_TIME_SEC = 60
+    WORKING_TIME_SEC = 120
 
 class Subsession(BaseSubsession):
     def creating_session(self):
@@ -36,8 +39,8 @@ class Subsession(BaseSubsession):
         # for each player we call a function (defined in Player's model) called get_or_create_task
         # this is done so that when a RET page is shown to a player for the first time they would already have a task
         # to work on
-        for p in self.get_players():
-            p.get_or_create_task()
+        # for p in self.get_players():
+        #     p.get_or_create_task()
 
 
 class Group(BaseGroup):
@@ -45,29 +48,83 @@ class Group(BaseGroup):
 
 
 class Player(BasePlayer):
-    # here we store all tasks solved in this specific round - for further analysis
-    tasks_dump = models.LongStringField(doc='to store all tasks with answers, diff level and feedback')
+    _num_tasks_correct = models.IntegerField(default=0)
+    _num_tasks_total = models.IntegerField(default=0)
+    def set_payoff(self):
+        self.payoff = self.num_tasks_correct(page_name='WorkPage') * self.session.config.get('stage1_fee', 0)
+        self.participant.vars['stage1payoff'] = self.payoff
 
-    # this method returns number of correct tasks solved in this round
-    @property
-    def num_tasks_correct(self):
-        return self.tasks.filter(correct_answer=F('answer')).count()
+    def live_ret(self, data):
+        answer = data.get('answer')
+        if answer:
+            old_task = self.get_or_create_task()
+            old_task.answer = answer
+            old_task.save()
+            new_task = self.get_or_create_task()
+            resp = {'task_body': new_task.html_body,
+                    'num_tasks_correct': self.num_tasks_correct(),
+                    'num_tasks_total': self.num_tasks_total(),
+                    'correct_answer': new_task.correct_answer
+                    }
 
-    # this method returns total number of tasks to which a player provided an answer
-    @property
-    def num_tasks_total(self):
-        return self.tasks.filter(answer__isnull=False).count()
+            return {self.id_in_group: resp}
 
-    # The following method checks if there are any unfinished (with no answer) tasks. If yes, we return the unfinished
-    # task. If there are no uncompleted tasks we create a new one using a task-generating function from session settings
+    def get_current_page_name(self):
+        
+        lookup = get_page_lookup(self.participant._session_code, self.participant._index_in_pages)
+        return lookup.page_class.__name__
+
+    def get_tasks_by_page(self, page_name=None):
+        page_name = page_name or self.get_current_page_name()
+        return self.tasks.filter(page_name=page_name)
+
+
+    def num_tasks_correct(self, page_name=None):
+        """returns total number of tasks to which a player provided a correct answer"""
+        page_name = page_name or self.get_current_page_name()
+        return self.get_tasks_by_page(page_name=page_name).filter(correct_answer=F('answer')).count()
+
+
+    def num_tasks_total(self, page_name=None):
+        """returns total number of tasks to which a player provided an answer"""
+        page_name = page_name or self.get_current_page_name()
+        return self.get_tasks_by_page(page_name=page_name).filter(answer__isnull=False, ).count()
+
     def get_or_create_task(self):
-        unfinished_tasks = self.tasks.filter(answer__isnull=True)
-        if unfinished_tasks.exists():
-            return unfinished_tasks.first()
-        else:
-            task = Task.create(self, self.session.vars['task_fun'], **self.session.vars['task_params'])
-            task.save()
-            return task
+        """
+            checks if there are any unfinished (with no answer) tasks. If yes, we return the unfinished
+            task. If there are no uncompleted tasks we create a new one using a task-generating function from session settings
+        """
+
+        page_name = self.get_current_page_name()
+        app_name = self._meta.app_label
+        try:
+            last_one = self.tasks.filter(page_name=page_name).latest()
+
+            nlast = last_one.in_player_counter
+        except ObjectDoesNotExist:
+            nlast = 0
+
+        try:
+            task = self.tasks.get(answer__isnull=True, page_name=page_name)
+        except ObjectDoesNotExist:
+            fallback_fun = getattr(ret_functions, self.session.config['task'])
+            fallback_params = { 'task_params': {'difficulty': 5},}
+            params = self.session.vars.get('task_params', fallback_params)
+            params['seed'] = app_name + page_name + str(self.round_number) +str(nlast)
+            fun = self.session.vars.get('task_fun', fallback_fun)
+            proto_task = fun(**params)
+
+            task = self.tasks.create(player=self,
+                                     body=proto_task.body,
+                                     html_body=proto_task.html_body,
+                                     correct_answer=proto_task.correct_answer,
+                                     task_name=proto_task.name,
+                                     in_player_counter=nlast + 1,
+                                     app_name=app_name,
+                                     page_name=page_name)
+
+        return task
 
 
 # This is a custom model that contains information about individual tasks. In each round, each player can have as many
@@ -79,15 +136,19 @@ class Player(BasePlayer):
 class Task(djmodels.Model):
     class Meta:
         ordering = ['-created_at']
+        get_latest_by = 'in_player_counter'
 
     player = djmodels.ForeignKey(to=Player, related_name='tasks', on_delete=djmodels.CASCADE)
     body = models.LongStringField()
     html_body = models.LongStringField()
     correct_answer = models.StringField()
     answer = models.StringField(null=True)
+    page_name = models.StringField()
+    app_name = models.StringField()
     created_at = djmodels.DateTimeField(auto_now_add=True)
     updated_at = djmodels.DateTimeField(auto_now=True)
     task_name = models.StringField()
+    in_player_counter = models.IntegerField(default=0)
     # the following method creates a new task, and requires as an input a task-generating function and (if any) some
     # parameters fed into task-generating function.
     @classmethod
